@@ -19,9 +19,9 @@
 #   EE_PROJECT_ID            – EE project id
 #   EE_SERVICE_ACCOUNT_KEY   – full SA JSON as a single string
 #
-# Model files expected in repo root:
-#   extratrees_s1_soil_moisture_points.pkl
-#   extratrees_s1_soil_moisture_features.txt
+# Model files are stored in a separate Hugging Face model repo:
+#   HF_MODEL_REPO / HF_MODEL_FILE
+#   HF_MODEL_REPO / HF_FEATURES_FILE
 #
 # Example AOI:
 #   examples/example_field.geojson
@@ -38,16 +38,70 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import gradio as gr
+from huggingface_hub import hf_hub_download
 
 import folium
 from folium.plugins import Draw
 
 # ------------------------------------------------------------
-# Paths for model + example AOI
+# Paths / config for model + example AOI
 # ------------------------------------------------------------
-MODEL_PATH = "extratrees_s1_soil_moisture_points.pkl"
-FEATURES_PATH = "extratrees_s1_soil_moisture_features.txt"
-EXAMPLE_AOI_PATH = "examples/example_field.geojson"  # <--- NEW
+
+# Hugging Face model repo that stores the ExtraTrees model + feature list
+HF_MODEL_REPO = os.environ.get(
+    "HF_MODEL_REPO",
+    "IWMIHQ/soil-moisture-sensor-optimizer-model",  # change if you used a different repo id
+)
+
+HF_MODEL_FILE = os.environ.get(
+    "HF_MODEL_FILE",
+    "extratrees_s1_soil_moisture_points.pkl",
+)
+
+HF_FEATURES_FILE = os.environ.get(
+    "HF_FEATURES_FILE",
+    "extratrees_s1_soil_moisture_features.txt",
+)
+
+EXAMPLE_AOI_PATH = "examples/example_field.geojson"
+
+
+def load_model_and_features():
+    """
+    Download the ExtraTrees model + feature list from a Hugging Face
+    model repo, then load them into memory.
+    """
+    try:
+        model_path = hf_hub_download(
+            repo_id=HF_MODEL_REPO,
+            filename=HF_MODEL_FILE,
+            repo_type="model",
+        )
+        features_path = hf_hub_download(
+            repo_id=HF_MODEL_REPO,
+            filename=HF_FEATURES_FILE,
+            repo_type="model",
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "Could not download model files from HF Hub.\n"
+            f"Repo: {HF_MODEL_REPO}\n"
+            f"Model file: {HF_MODEL_FILE}\n"
+            f"Features file: {HF_FEATURES_FILE}\n"
+            f"Original error: {e}"
+        )
+
+    model = joblib.load(model_path)
+    with open(features_path, "r") as f:
+        feature_cols = [ln.strip() for ln in f.readlines() if ln.strip()]
+
+    print(f"✅ Loaded model from {HF_MODEL_REPO}/{HF_MODEL_FILE}")
+    print(f"✅ Loaded {len(feature_cols)} feature names.")
+    return model, feature_cols
+
+
+# Load once at import time
+MODEL, FEATURE_COLS = load_model_and_features()
 
 
 # ------------------------------------------------------------
@@ -502,17 +556,9 @@ def predict_sm_on_grid(date_target, plot_geojson_path, cell_size_m):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    if not os.path.exists(MODEL_PATH) or not os.path.exists(FEATURES_PATH):
-        raise FileNotFoundError(
-            "Model or feature file not found.\n"
-            "Make sure you added to the repo:\n"
-            f"  - {MODEL_PATH}\n"
-            f"  - {FEATURES_PATH}"
-        )
-
-    model = joblib.load(MODEL_PATH)
-    with open(FEATURES_PATH, "r") as f:
-        feature_cols = [ln.strip() for ln in f.readlines() if ln.strip()]
+    # Use model + feature list loaded from HF Hub
+    model = MODEL
+    feature_cols = FEATURE_COLS
 
     for col in feature_cols:
         if col not in df.columns:
@@ -876,7 +922,7 @@ with gr.Blocks(
                 type="filepath",
             )
 
-            # New "Load example AOI" button
+            # "Load example AOI" button
             example_button = gr.Button(
                 "📂 Load example AOI",
                 variant="secondary",
@@ -1014,7 +1060,7 @@ with gr.Blocks(
         outputs=[drawer_map_html],
     )
 
-    # NEW: Load example AOI into File component
+    # Load example AOI into File component
     example_button.click(
         fn=load_example_aoi,
         inputs=None,
