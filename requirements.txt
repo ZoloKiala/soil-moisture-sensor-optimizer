@@ -1,9 +1,10 @@
-huggingface_hub
-joblib
 earthengine-api
 folium
 gradio
-pandas
-numpy
+huggingface_hub
+joblib
 matplotlib
+numpy
+pandas
 requests
+scikit-learn
