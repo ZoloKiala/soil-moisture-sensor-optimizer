@@ -1,5 +1,3 @@
-# Soil Moisture Sensor Optimization (Sentinel-1 + ExtraTrees)
-
 ---
 title: soil-moisture-sensor-optimizer
 emoji: 🌱
