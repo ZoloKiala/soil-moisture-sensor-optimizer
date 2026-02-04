@@ -1,5 +1,19 @@
 # Soil Moisture Sensor Optimization (Sentinel-1 + ExtraTrees)
 
+---
+title: soil-moisture-sensor-optimizer
+emoji: 🌱
+colorFrom: green
+colorTo: blue
+sdk: gradio
+sdk_version: "4.0.0"
+python_version: "3.10"
+app_file: app.py
+pinned: false
+---
+
+
+
 Interactive app to plan soil moisture sensor layouts for a field:
 
 - Upload a **field polygon** (GeoJSON) or draw an AOI on a map.
