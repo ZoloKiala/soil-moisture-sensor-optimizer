@@ -4,54 +4,46 @@
 # ------------------------------------------------------------
 # - Upload field GeoJSON (or draw AOI on map & export)
 # - For a given date:
-#       • Build grids at various cell sizes
-#       • Predict SM (ExtraTrees) at centroids
+#       • Build grids at various cell sizes (GeoPandas + UTM)
+#       • Predict SM (ExtraTrees) at centroids via Earth Engine
 #       • Compute CV (%)
-#       • Return optimal N sensors (min CV)
+#       • Return optimal N sensors (min CV, with tolerance rule)
 # - UI:
-#       • Left: inputs + AOI drawer (folium Draw + search box)
+#       • Left: inputs + AOI drawer (folium Draw + search + geolocation)
 #       • Right tabs:
 #           - Optimization (CV vs N + table)
 #           - Sensor layout (SM basemap + sensor locations)
-#
-# EE auth: via env vars
-#   EE_SERVICE_ACCOUNT       – service account email
-#   EE_PROJECT_ID            – EE project id
-#   EE_SERVICE_ACCOUNT_KEY   – full SA JSON as a single string
-#
-# Model files are stored in a separate Hugging Face model repo:
-#   HF_MODEL_REPO / HF_MODEL_FILE
-#   HF_MODEL_REPO / HF_FEATURES_FILE
-#
-# Example AOI:
-#   examples/example_field.geojson
 # ============================================================
 
 import os
 import json
 import math
-import requests
+from pathlib import Path
 
+import requests
 import ee
 import joblib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import gradio as gr
+
 from huggingface_hub import hf_hub_download
+
+import geopandas as gpd
+from shapely.geometry import box
 
 import folium
 from folium.plugins import Draw, LocateControl
-from branca.colormap import linear  # <-- NEW: for SM color scale
+from branca.colormap import linear
 
 # ------------------------------------------------------------
 # Paths / config for model + example AOI
 # ------------------------------------------------------------
 
-# Hugging Face model repo that stores the ExtraTrees model + feature list
 HF_MODEL_REPO = os.environ.get(
     "HF_MODEL_REPO",
-    "IWMIHQ/soil-moisture-sensor-optimizer-model",  # change if you used a different repo id
+    "IWMIHQ/soil-moisture-sensor-optimizer-model",
 )
 
 HF_MODEL_FILE = os.environ.get(
@@ -106,7 +98,7 @@ MODEL, FEATURE_COLS = load_model_and_features()
 
 
 # ------------------------------------------------------------
-# AOI drawer map (folium) – Draw only
+# AOI drawer map (folium) – Draw + Search + Geolocation
 # ------------------------------------------------------------
 
 def make_drawer_map_html(center_lat: float = -23.0,
@@ -114,16 +106,37 @@ def make_drawer_map_html(center_lat: float = -23.0,
                          zoom: int = 7) -> str:
     """
     Returns a folium map HTML string with:
-      - OSM basemap
+      - OSM basemap (default)
+      - Esri World Imagery (satellite) basemap
       - Draw control (polygon only) with export to GeoJSON
-      - Geolocation button ("locate me")
+      - Geolocation button ("locate me") that auto-switches to satellite
+        when the location is found.
     """
     m = folium.Map(
         location=[center_lat, center_lon],
         zoom_start=zoom,
-        tiles="OpenStreetMap",
+        tiles=None,
         control_scale=True,
     )
+
+    # Base layers
+    osm_layer = folium.TileLayer(
+        "OpenStreetMap",
+        name="OpenStreetMap",
+        control=True,
+        show=True,
+    ).add_to(m)
+
+    sat_layer = folium.TileLayer(
+        tiles=(
+            "https://services.arcgisonline.com/ArcGIS/rest/services/"
+            "World_Imagery/MapServer/tile/{z}/{y}/{x}"
+        ),
+        attr="Esri, Maxar, Earthstar Geographics",
+        name="Esri World Imagery",
+        control=True,
+        show=False,
+    ).add_to(m)
 
     # Draw tools (polygon only)
     Draw(
@@ -144,21 +157,45 @@ def make_drawer_map_html(center_lat: float = -23.0,
         },
     ).add_to(m)
 
-    # 🔵 Geolocation ("locate me") button
+    # Geolocation ("locate me") button – auto start, top-right
     LocateControl(
         auto_start=True,
-        position="topleft",
-        strings={"title": "Show my location"},
+        position="topright",
+        strings={"title": "My location"},
         flyTo=True,
         keepCurrentZoomLevel=False,
+        drawCircle=True,
+        drawMarker=True,
     ).add_to(m)
+
+    folium.LayerControl().add_to(m)
+
+    # JS hook: when location is found, switch to satellite
+    map_js_name = m.get_name()
+    osm_js_name = osm_layer.get_name()
+    sat_js_name = sat_layer.get_name()
+
+    switch_script = f"""
+    <script>
+    {map_js_name}.on('locationfound', function(e) {{
+        try {{
+            {map_js_name}.removeLayer({osm_js_name});
+        }} catch (err) {{
+            console.log('OSM layer remove error:', err);
+        }}
+        {map_js_name}.addLayer({sat_js_name});
+    }});
+    </script>
+    """
+
+    m.get_root().html.add_child(folium.Element(switch_script))
 
     return m._repr_html_()
 
+
 def geocode_place(query: str):
     """
-    Use OpenStreetMap Nominatim to get (lat, lon) from a place name
-    for the external Gradio search box.
+    Use OpenStreetMap Nominatim to get (lat, lon) from a place name.
     """
     url = "https://nominatim.openstreetmap.org/search"
     params = {"q": query, "format": "json", "limit": 1}
@@ -177,8 +214,6 @@ def geocode_place(query: str):
 def update_drawer_map(search_query: str) -> str:
     """
     Gradio callback to refresh the AOI drawer map.
-    - If search_query is empty → default Limpopo view.
-    - Else → geocode and center map on that place (zoom=13).
     """
     if not search_query or not search_query.strip():
         return make_drawer_map_html()
@@ -209,15 +244,10 @@ EE_KEY_JSON = os.environ.get("EE_SERVICE_ACCOUNT_KEY")  # full JSON as string
 
 
 def init_earth_engine():
-    """
-    Initialize Earth Engine using a service-account JSON stored
-    in the EE_SERVICE_ACCOUNT_KEY environment variable (HF secret).
-    """
     if EE_KEY_JSON is None:
         raise RuntimeError(
             "EE_SERVICE_ACCOUNT_KEY env var is not set.\n"
-            "In your Hugging Face Space, go to Settings → Variables & secrets, "
-            "and add EE_SERVICE_ACCOUNT_KEY with the full service-account JSON."
+            "Add EE_SERVICE_ACCOUNT_KEY with the full service-account JSON."
         )
 
     key_path = "/tmp/ee-service-account.json"
@@ -232,7 +262,6 @@ def init_earth_engine():
     print(f"✅ EE initialized: {SA_EMAIL} | project={PROJECT_ID}")
 
 
-# Initialize EE BEFORE defining DEM/S1 collections
 init_earth_engine()
 
 # ---------------------------
@@ -416,70 +445,94 @@ def attach_s1_nearest_composite_past(fc_obs, s1_comps, max_days_diff=6):
 
 
 # ============================================================
-# 2) Build grid centroids (WGS84)
+# 2) Build grid centroids (GeoPandas + UTM → EE)
 # ============================================================
 
 def build_plot_grid_centroids(date_str, plot_geojson_path, cell_size_m):
-    if not os.path.exists(plot_geojson_path):
+    """
+    Build a regular grid over the AOI using a local UTM CRS
+    (meter-based), clip it to the AOI, compute centroids, then
+    return as an Earth Engine FeatureCollection (WGS84) plus
+    the AOI geometry as ee.Geometry.
+    """
+    plot_geojson_path = Path(plot_geojson_path)
+    if not plot_geojson_path.exists():
         raise FileNotFoundError(
             f"Plot GeoJSON not found at {plot_geojson_path}."
         )
 
-    with open(plot_geojson_path, "r") as f:
-        gj = json.load(f)
-    geom = ee.Geometry(gj["features"][0]["geometry"])
+    print(f"[READ] {plot_geojson_path}")
+    aoi = gpd.read_file(plot_geojson_path)
 
-    bounds = geom.bounds(maxError=1)
-    coords = ee.List(bounds.coordinates().get(0))
+    if aoi.empty:
+        raise RuntimeError("AOI file has no features.")
 
-    ll = ee.List(coords.get(0))  # [minLon, minLat]
-    ur = ee.List(coords.get(2))  # [maxLon, maxLat]
+    aoi = aoi.dissolve().reset_index(drop=True)
 
-    min_lon = ee.Number(ll.get(0))
-    min_lat = ee.Number(ll.get(1))
-    max_lon = ee.Number(ur.get(0))
-    max_lat = ee.Number(ur.get(1))
+    print("[CRS] Estimating local UTM CRS...")
+    utm_crs = aoi.estimate_utm_crs()
+    aoi_utm = aoi.to_crs(utm_crs)
 
-    cell_deg_lat = cell_size_m / 111_320.0
-    cell_deg_lat_num = ee.Number(cell_deg_lat)
+    minx, miny, maxx, maxy = aoi_utm.total_bounds
+    print(f"[BOUNDS] {minx:.2f}, {miny:.2f}, {maxx:.2f}, {maxy:.2f}")
 
-    lat_center = min_lat.add(max_lat).divide(2.0)
-    lat_center_rad = lat_center.multiply(math.pi / 180.0)
-    cos_phi = lat_center_rad.cos()
-    cell_deg_lon = ee.Number(cell_size_m / 111_320.0).divide(cos_phi)
+    n_cols = math.ceil((maxx - minx) / cell_size_m)
+    n_rows = math.ceil((maxy - miny) / cell_size_m)
+    print(f"[GRID] rows={n_rows} cols={n_cols} cell_size={cell_size_m} m")
 
-    half_lon = cell_deg_lon.divide(2.0)
-    half_lat = cell_deg_lat_num.divide(2.0)
+    grid_polys = []
+    for i in range(n_cols):
+        x0 = minx + i * cell_size_m
+        x1 = x0 + cell_size_m
+        for j in range(n_rows):
+            y0 = miny + j * cell_size_m
+            y1 = y0 + cell_size_m
+            cell = box(x0, y0, x1, y1)
+            grid_polys.append(cell)
 
-    xs = ee.List.sequence(
-        min_lon.add(half_lon), max_lon.subtract(half_lon), cell_deg_lon
-    )
-    ys = ee.List.sequence(
-        min_lat.add(half_lat), max_lat.subtract(half_lat), cell_deg_lat_num
-    )
+    grid = gpd.GeoDataFrame({"geometry": grid_polys}, crs=utm_crs)
 
-    def make_row(y):
-        y = ee.Number(y)
+    print("[CLIP] Clipping grid to AOI...")
+    grid_clip = gpd.overlay(grid, aoi_utm, how="intersection")
 
-        def make_pt(x):
-            x = ee.Number(x)
-            pt = ee.Geometry.Point([x, y])
-            return ee.Feature(
-                pt,
-                {
-                    "lon": x,
-                    "lat": y,
-                    "date": date_str,
-                    "Sheet": "plot_grid",
-                },
-            )
+    if grid_clip.empty:
+        raise RuntimeError(
+            f"Clipped grid is empty for cell_size_m={cell_size_m}. "
+            "Try a larger cell size or check your AOI geometry."
+        )
 
-        return xs.map(make_pt)
+    print("[CENTROIDS] Computing centroids in UTM...")
+    centroids = grid_clip.copy()
+    centroids["geometry"] = centroids.centroid
 
-    grid_list = ys.map(make_row)
-    grid_fc = ee.FeatureCollection(ee.List(grid_list).flatten())
-    grid_fc = grid_fc.filterBounds(geom)
-    return grid_fc, geom
+    print("[CRS] Reprojecting AOI & centroids to EPSG:4326 ...")
+    aoi_4326 = aoi_utm.to_crs(epsg=4326)
+    centroids_4326 = centroids.to_crs(epsg=4326)
+
+    aoi_union = aoi_4326.geometry.unary_union
+    aoi_geojson = aoi_union.__geo_interface__
+    geom = ee.Geometry(aoi_geojson)
+
+    features = []
+    for _, row in centroids_4326.iterrows():
+        pt = row.geometry
+        lon = float(pt.x)
+        lat = float(pt.y)
+        feat = ee.Feature(
+            ee.Geometry.Point([lon, lat]),
+            {
+                "lon": lon,
+                "lat": lat,
+                "date": date_str,
+                "Sheet": "plot_grid",
+            },
+        )
+        features.append(feat)
+
+    fc_pts = ee.FeatureCollection(features)
+    print(f"[EE] Built {len(features)} centroids in EE FeatureCollection.")
+
+    return fc_pts, geom
 
 
 # ============================================================
@@ -487,13 +540,6 @@ def build_plot_grid_centroids(date_str, plot_geojson_path, cell_size_m):
 # ============================================================
 
 def predict_sm_on_grid(date_target, plot_geojson_path, cell_size_m):
-    """
-    Build a regular grid over the field, attach S1 + DEM predictors,
-    run ExtraTrees to predict soil moisture at each centroid and
-    compute CV%. Returns:
-        cv_pct, df_out, geom
-    where df_out has lon, lat, sm_pred and predictor columns.
-    """
     fc_pts, geom = build_plot_grid_centroids(
         date_target, plot_geojson_path, cell_size_m
     )
@@ -553,7 +599,6 @@ def predict_sm_on_grid(date_target, plot_geojson_path, cell_size_m):
     if len(df) == 0:
         raise RuntimeError("Joined dataframe is empty (no rows).")
 
-    # Feature engineering (must match training)
     for col in ["VV", "VH", "angle"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -574,7 +619,6 @@ def predict_sm_on_grid(date_target, plot_geojson_path, cell_size_m):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Use model + feature list loaded from HF Hub
     model = MODEL
     feature_cols = FEATURE_COLS
 
@@ -634,7 +678,7 @@ def predict_sm_on_grid(date_target, plot_geojson_path, cell_size_m):
 
 
 # ============================================================
-# 4) Gradio core: run multiple grid sizes
+# 4) Gradio core: run multiple grid sizes (CV tolerance rule)
 # ============================================================
 
 def run_sensor_optimization(date_target, geojson_file, cell_sizes_str):
@@ -645,7 +689,6 @@ def run_sensor_optimization(date_target, geojson_file, cell_sizes_str):
         )
         raise gr.Error(msg)
 
-    # With type="filepath", geojson_file is already a path string
     plot_geojson_path = str(geojson_file)
 
     try:
@@ -689,11 +732,29 @@ def run_sensor_optimization(date_target, geojson_file, cell_sizes_str):
         .reset_index(drop=True)
     )
 
-    opt_idx = int(np.nanargmin(summary_df["cv_percent"].values))
-    opt_n = int(summary_df.loc[opt_idx, "n_sensors"])
-    opt_cv = float(summary_df.loc[opt_idx, "cv_percent"])
-    opt_cell = int(summary_df.loc[opt_idx, "cell_size_m"])
+    # ----- Optimal choice: "statistically similar" CV -> fewer sensors -----
+    CV_TOLERANCE = 0.5  # CV percentage points
 
+    min_cv = float(summary_df["cv_percent"].min())
+    candidates = summary_df[summary_df["cv_percent"] <= min_cv + CV_TOLERANCE].copy()
+
+    best_row = candidates.sort_values("n_sensors").iloc[0]
+
+    opt_n = int(best_row["n_sensors"])
+    opt_cv = float(best_row["cv_percent"])
+    opt_cell = int(best_row["cell_size_m"])
+
+    print("\n[OPTIMAL GRID SELECTION]")
+    print(f"  Min CV overall        : {min_cv:.3f} %")
+    print(f"  CV tolerance          : ±{CV_TOLERANCE:.3f} %")
+    print("  Candidate grids (within tolerance):")
+    print(candidates)
+    print(
+        f"  → Chosen grid: cell_size={opt_cell} m, "
+        f"n_sensors={opt_n}, cv={opt_cv:.3f} %"
+    )
+
+    # Plot CV vs N, highlight optimal configuration
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.plot(summary_df["n_sensors"], summary_df["cv_percent"], marker="o")
     ax.set_xlabel("Number of sensors (N centroids)")
@@ -735,8 +796,8 @@ def show_centroid_map(date_target, geojson_file, cell_size_m):
     """
     Build grid centroids for a single cell size, run the model
     to predict soil moisture, and render:
-        - A raster-like SM basemap (colored grid cells)
-        - Red sensor locations (centroids) on top
+        - SM basemap (colored rectangles)
+        - Red sensor locations on top
         - Table of coordinates + predicted SM
     """
     empty = pd.DataFrame(
@@ -758,7 +819,7 @@ def show_centroid_map(date_target, geojson_file, cell_size_m):
         msg = "<i>Cell size must be a single integer (e.g. 10, 20, 30).</i>"
         return msg, empty
 
-    # --- Run model inference for this grid size (same as optimization) ---
+    # Run inference for this grid size
     try:
         cv_pct, df_sm, geom = predict_sm_on_grid(
             date_target, plot_geojson_path, cell_size_m
@@ -779,11 +840,9 @@ def show_centroid_map(date_target, geojson_file, cell_size_m):
 
     print(f"🗺️ Preview map: {n_pts} centroids for cell size {cell_size_m} m")
 
-    # --- Map centre from field geometry ---
     centroid = geom.centroid().coordinates().getInfo()
     lon_c, lat_c = centroid[0], centroid[1]
 
-    # Base map – satellite + labels style
     m = folium.Map(
         location=[lat_c, lon_c],
         zoom_start=16,
@@ -794,10 +853,11 @@ def show_centroid_map(date_target, geojson_file, cell_size_m):
         tiles="https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
         attr="Esri, Maxar, Earthstar Geographics",
         name="Esri World Imagery",
+        show=True,
     ).add_to(m)
-    folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
+    folium.TileLayer("OpenStreetMap", name="OpenStreetMap", show=False).add_to(m)
 
-    # Add field polygon from uploaded GeoJSON
+    # Field polygon
     try:
         with open(plot_geojson_path, "r") as f:
             gj = json.load(f)
@@ -813,7 +873,7 @@ def show_centroid_map(date_target, geojson_file, cell_size_m):
     except Exception as e:
         print("⚠️ Could not add field polygon to map:", e)
 
-    # --- SM basemap: colored rectangles around each centroid ---
+    # SM basemap (rectangles)
     df_sm = df_sm.copy()
     df_sm["lon"] = pd.to_numeric(df_sm["lon"], errors="coerce")
     df_sm["lat"] = pd.to_numeric(df_sm["lat"], errors="coerce")
@@ -822,7 +882,6 @@ def show_centroid_map(date_target, geojson_file, cell_size_m):
     sm_min = float(df_sm["sm_pred"].min())
     sm_max = float(df_sm["sm_pred"].max())
     if sm_min == sm_max:
-        # avoid zero-range scale
         sm_min -= 0.5
         sm_max += 0.5
 
@@ -830,8 +889,6 @@ def show_centroid_map(date_target, geojson_file, cell_size_m):
     colormap.caption = "Predicted soil moisture (%)"
     colormap.add_to(m)
 
-    # cell size in degrees (approx) for rectangles
-    # use per-row lat to handle lat-dependent lon scale
     rect_group = folium.FeatureGroup(name="SM basemap")
     for _, row in df_sm.iterrows():
         lat = row["lat"]
@@ -857,13 +914,13 @@ def show_centroid_map(date_target, geojson_file, cell_size_m):
             bounds=bounds,
             fill=True,
             fill_color=colormap(sm),
-            fill_opacity=0.85,
+            fill_opacity=0.8,
             stroke=False,
         ).add_to(rect_group)
 
     rect_group.add_to(m)
 
-    # --- Sensor locations: red circles at centroids ---
+    # Centroids / sensors – added AFTER rectangles so they are on top
     df_coords = df_sm[["lon", "lat", "sm_pred"]].copy()
     df_coords["lon"] = df_coords["lon"].round(6)
     df_coords["lat"] = df_coords["lat"].round(6)
@@ -876,19 +933,21 @@ def show_centroid_map(date_target, geojson_file, cell_size_m):
     for _, row in df_coords.iterrows():
         folium.CircleMarker(
             location=[row["Latitude (°S)"], row["Longitude (°E)"]],
-            radius=4,
+            radius=5,               # a bit larger so clearly visible
             color="#ef4444",
+            weight=1,
             fill=True,
-            fill_opacity=0.9,
+            fill_color="#ef4444",
+            fill_opacity=0.95,
             popup=(
                 f"id={int(row['sensor_id'])}<br>"
                 f"SM={row['sm_pred']:.2f} %<br>"
                 f"lon={row['Longitude (°E)']}, lat={row['Latitude (°S)']}"
             ),
         ).add_to(points_group)
-    points_group.add_to(m)
 
-    # Legend for red points (SM legend comes from colormap)
+    points_group.add_to(m)  # LAST → draws on top of rectangles
+
     legend_html = """
     <div style="
         position: fixed;
@@ -921,16 +980,11 @@ def show_centroid_map(date_target, geojson_file, cell_size_m):
 # ============================================================
 
 def load_example_aoi():
-    """
-    Gradio callback that sets the GeoJSON file input to a local
-    example AOI (examples/example_field.geojson).
-    """
     if not os.path.exists(EXAMPLE_AOI_PATH):
         raise gr.Error(
             f"Example AOI not found at '{EXAMPLE_AOI_PATH}'. "
             "Make sure the file exists in your repo."
         )
-    # For File(type="filepath"), we just return the path string
     return EXAMPLE_AOI_PATH
 
 
@@ -996,7 +1050,6 @@ with gr.Blocks(
                 placeholder="5,10,20,30",
             )
 
-            # IMPORTANT: type="filepath" so we can programmatically set value
             geojson_input = gr.File(
                 label="Field polygon (GeoJSON; EPSG:4326, Polygon/MultiPolygon)",
                 file_types=[".geojson"],
@@ -1004,7 +1057,6 @@ with gr.Blocks(
                 type="filepath",
             )
 
-            # "Load example AOI" button
             example_button = gr.Button(
                 "📂 Load example AOI",
                 variant="secondary",
@@ -1031,9 +1083,10 @@ with gr.Blocks(
                     """
                     <div class="small-note">
                     1. Use the search box above or just pan/zoom on the map.<br>
-                    2. Draw a polygon with the draw tools (top-left).<br>
-                    3. Use the <b>Export</b> button in the draw toolbar to download <code>aoi.geojson</code>.<br>
-                    4. Upload that file in the <b>Field polygon</b> input above — or click <b>Load example AOI</b>.
+                    2. Let the geolocation button find you, or navigate manually.<br>
+                    3. Draw a polygon with the draw tools (top-left).<br>
+                    4. Use the <b>Export</b> button in the draw toolbar to download <code>aoi.geojson</code>.<br>
+                    5. Upload that file in the <b>Field polygon</b> input above — or click <b>Load example AOI</b>.
                     </div>
                     """,
                     elem_classes=["small-note"],
@@ -1069,7 +1122,8 @@ with gr.Blocks(
                         """
                         <div class="small-note">
                         The optimal configuration is marked with a star ⭐ on the graph, and corresponds to the
-                        lowest coefficient of variation (CV%) in predicted soil moisture.
+                        lowest coefficient of variation (CV%) in predicted soil moisture, subject to the rule
+                        that if CVs are similar we prefer fewer sensors.
                         </div>
                         """,
                         elem_classes=["small-note"],
@@ -1080,7 +1134,7 @@ with gr.Blocks(
 
                     map_cell_size_input = gr.Dropdown(
                         label="Grid cell size for map (m)",
-                        choices=[5, 10, 20, 30],
+                        choices=[5, 10, 20, 30, 50],
                         value=10,
                         interactive=True,
                         info="Choose one grid size to preview SM map and centroid locations.",
@@ -1106,7 +1160,7 @@ with gr.Blocks(
                         """
                         <div class="small-note">
                         The coloured grid shows predicted soil moisture (%) from the model.  
-                        Red points mark sensor locations (grid centroids) with their coordinates and SM values.
+                        Red points (layers added on top) mark sensor locations with their coordinates and SM values.
                         </div>
                         """,
                         elem_classes=["small-note"],
@@ -1123,7 +1177,6 @@ with gr.Blocks(
         elem_classes=["small-note"],
     )
 
-    # Wiring
     run_button.click(
         fn=run_sensor_optimization,
         inputs=[date_input, geojson_input, cell_sizes_input],
@@ -1142,13 +1195,11 @@ with gr.Blocks(
         outputs=[drawer_map_html],
     )
 
-    # Load example AOI into File component
     example_button.click(
         fn=load_example_aoi,
         inputs=None,
         outputs=[geojson_input],
     )
 
-# For HF Spaces and local testing
 if __name__ == "__main__":
     demo.launch()
