@@ -12,7 +12,7 @@
 #       • Left: inputs + AOI drawer (folium Draw + search box)
 #       • Right tabs:
 #           - Optimization (CV vs N + table)
-#           - Sensor layout (centroid map + coordinates)
+#           - Sensor layout (SM basemap + sensor locations)
 #
 # EE auth: via env vars
 #   EE_SERVICE_ACCOUNT       – service account email
@@ -41,7 +41,8 @@ import gradio as gr
 from huggingface_hub import hf_hub_download
 
 import folium
-from folium.plugins import Draw
+from folium.plugins import Draw, LocateControl
+from branca.colormap import linear  # <-- NEW: for SM color scale
 
 # ------------------------------------------------------------
 # Paths / config for model + example AOI
@@ -115,6 +116,7 @@ def make_drawer_map_html(center_lat: float = -23.0,
     Returns a folium map HTML string with:
       - OSM basemap
       - Draw control (polygon only) with export to GeoJSON
+      - Geolocation button ("locate me")
     """
     m = folium.Map(
         location=[center_lat, center_lon],
@@ -123,6 +125,7 @@ def make_drawer_map_html(center_lat: float = -23.0,
         control_scale=True,
     )
 
+    # Draw tools (polygon only)
     Draw(
         export=True,
         filename="aoi.geojson",
@@ -141,8 +144,16 @@ def make_drawer_map_html(center_lat: float = -23.0,
         },
     ).add_to(m)
 
-    return m._repr_html_()
+    # 🔵 Geolocation ("locate me") button
+    LocateControl(
+        auto_start=True,
+        position="topleft",
+        strings={"title": "Show my location"},
+        flyTo=True,
+        keepCurrentZoomLevel=False,
+    ).add_to(m)
 
+    return m._repr_html_()
 
 def geocode_place(query: str):
     """
@@ -476,6 +487,13 @@ def build_plot_grid_centroids(date_str, plot_geojson_path, cell_size_m):
 # ============================================================
 
 def predict_sm_on_grid(date_target, plot_geojson_path, cell_size_m):
+    """
+    Build a regular grid over the field, attach S1 + DEM predictors,
+    run ExtraTrees to predict soil moisture at each centroid and
+    compute CV%. Returns:
+        cv_pct, df_out, geom
+    where df_out has lon, lat, sm_pred and predictor columns.
+    """
     fc_pts, geom = build_plot_grid_centroids(
         date_target, plot_geojson_path, cell_size_m
     )
@@ -710,16 +728,20 @@ def run_sensor_optimization(date_target, geojson_file, cell_sizes_str):
 
 
 # ============================================================
-# 5) Centroid map (folium) + coordinates table
+# 5) Centroid map (folium) + SM basemap + coordinates table
 # ============================================================
 
 def show_centroid_map(date_target, geojson_file, cell_size_m):
     """
-    Build grid centroids for a single cell size and render them on
-    a folium map, plus a coords table:
-        sensor_id, Longitude (°E), Latitude (°S)
+    Build grid centroids for a single cell size, run the model
+    to predict soil moisture, and render:
+        - A raster-like SM basemap (colored grid cells)
+        - Red sensor locations (centroids) on top
+        - Table of coordinates + predicted SM
     """
-    empty = pd.DataFrame(columns=["sensor_id", "Longitude (°E)", "Latitude (°S)"])
+    empty = pd.DataFrame(
+        columns=["sensor_id", "Longitude (°E)", "Latitude (°S)", "sm_pred"]
+    )
 
     if geojson_file is None:
         msg = (
@@ -736,10 +758,18 @@ def show_centroid_map(date_target, geojson_file, cell_size_m):
         msg = "<i>Cell size must be a single integer (e.g. 10, 20, 30).</i>"
         return msg, empty
 
-    fc_pts, geom = build_plot_grid_centroids(
-        date_target, plot_geojson_path, cell_size_m
-    )
-    n_pts = fc_pts.size().getInfo()
+    # --- Run model inference for this grid size (same as optimization) ---
+    try:
+        cv_pct, df_sm, geom = predict_sm_on_grid(
+            date_target, plot_geojson_path, cell_size_m
+        )
+    except Exception as e:
+        msg = (
+            f"<i>Could not build SM map for this configuration: {e}</i>"
+        )
+        return msg, empty
+
+    n_pts = len(df_sm)
     if n_pts == 0:
         msg = (
             f"<i>No grid centroids inside the plot for cell_size_m={cell_size_m} m. "
@@ -749,6 +779,7 @@ def show_centroid_map(date_target, geojson_file, cell_size_m):
 
     print(f"🗺️ Preview map: {n_pts} centroids for cell size {cell_size_m} m")
 
+    # --- Map centre from field geometry ---
     centroid = geom.centroid().coordinates().getInfo()
     lon_c, lat_c = centroid[0], centroid[1]
 
@@ -782,18 +813,66 @@ def show_centroid_map(date_target, geojson_file, cell_size_m):
     except Exception as e:
         print("⚠️ Could not add field polygon to map:", e)
 
-    # Get centroid coordinates as pandas
-    df_coords = fc_to_pandas(fc_pts, force_columns=["lon", "lat"])
-    df_coords = df_coords[["lon", "lat"]].copy()
-    df_coords["lon"] = pd.to_numeric(df_coords["lon"], errors="coerce").round(6)
-    df_coords["lat"] = pd.to_numeric(df_coords["lat"], errors="coerce").round(6)
+    # --- SM basemap: colored rectangles around each centroid ---
+    df_sm = df_sm.copy()
+    df_sm["lon"] = pd.to_numeric(df_sm["lon"], errors="coerce")
+    df_sm["lat"] = pd.to_numeric(df_sm["lat"], errors="coerce")
+    df_sm["sm_pred"] = pd.to_numeric(df_sm["sm_pred"], errors="coerce")
+
+    sm_min = float(df_sm["sm_pred"].min())
+    sm_max = float(df_sm["sm_pred"].max())
+    if sm_min == sm_max:
+        # avoid zero-range scale
+        sm_min -= 0.5
+        sm_max += 0.5
+
+    colormap = linear.viridis.scale(sm_min, sm_max)
+    colormap.caption = "Predicted soil moisture (%)"
+    colormap.add_to(m)
+
+    # cell size in degrees (approx) for rectangles
+    # use per-row lat to handle lat-dependent lon scale
+    rect_group = folium.FeatureGroup(name="SM basemap")
+    for _, row in df_sm.iterrows():
+        lat = row["lat"]
+        lon = row["lon"]
+        sm = row["sm_pred"]
+
+        if np.isnan(lat) or np.isnan(lon) or np.isnan(sm):
+            continue
+
+        cell_deg_lat = cell_size_m / 111_320.0
+        lat_rad = math.radians(lat)
+        cell_deg_lon = (cell_size_m / 111_320.0) / max(math.cos(lat_rad), 1e-6)
+
+        half_lat = cell_deg_lat / 2.0
+        half_lon = cell_deg_lon / 2.0
+
+        bounds = [
+            [lat - half_lat, lon - half_lon],
+            [lat + half_lat, lon + half_lon],
+        ]
+
+        folium.Rectangle(
+            bounds=bounds,
+            fill=True,
+            fill_color=colormap(sm),
+            fill_opacity=0.85,
+            stroke=False,
+        ).add_to(rect_group)
+
+    rect_group.add_to(m)
+
+    # --- Sensor locations: red circles at centroids ---
+    df_coords = df_sm[["lon", "lat", "sm_pred"]].copy()
+    df_coords["lon"] = df_coords["lon"].round(6)
+    df_coords["lat"] = df_coords["lat"].round(6)
     df_coords.insert(0, "sensor_id", np.arange(1, len(df_coords) + 1))
     df_coords.rename(
         columns={"lon": "Longitude (°E)", "lat": "Latitude (°S)"}, inplace=True
     )
 
-    # Add centroids as red circles
-    fg = folium.FeatureGroup(name=f"Centroids ({n_pts} sensors)")
+    points_group = folium.FeatureGroup(name=f"Centroids ({n_pts} sensors)")
     for _, row in df_coords.iterrows():
         folium.CircleMarker(
             location=[row["Latitude (°S)"], row["Longitude (°E)"]],
@@ -801,12 +880,15 @@ def show_centroid_map(date_target, geojson_file, cell_size_m):
             color="#ef4444",
             fill=True,
             fill_opacity=0.9,
-            popup=f"id={int(row['sensor_id'])}<br>"
-                  f"lon={row['Longitude (°E)']}, lat={row['Latitude (°S)']}",
-        ).add_to(fg)
-    fg.add_to(m)
+            popup=(
+                f"id={int(row['sensor_id'])}<br>"
+                f"SM={row['sm_pred']:.2f} %<br>"
+                f"lon={row['Longitude (°E)']}, lat={row['Latitude (°S)']}"
+            ),
+        ).add_to(points_group)
+    points_group.add_to(m)
 
-    # Simple legend
+    # Legend for red points (SM legend comes from colormap)
     legend_html = """
     <div style="
         position: fixed;
@@ -820,10 +902,10 @@ def show_centroid_map(date_target, geojson_file, cell_size_m):
         font-size: 12px;
         box-shadow: 0 2px 6px rgba(0,0,0,0.3);
     ">
-      <b>Soil moisture sensors</b><br>
+      <b>Map features</b><br>
       <span style="display:inline-block;width:10px;height:10px;
                    border-radius:50%;background:#ef4444;margin-right:4px;"></span>
-      Grid centroids
+      Soil moisture sensors (grid centroids)
     </div>
     """
     m.get_root().html.add_child(folium.Element(legend_html))
@@ -994,14 +1076,14 @@ with gr.Blocks(
                     )
 
                 with gr.Tab("Sensor layout preview"):
-                    gr.Markdown("### 🗺️ Centroids and coordinates")
+                    gr.Markdown("### 🗺️ SM basemap and sensor locations")
 
                     map_cell_size_input = gr.Dropdown(
                         label="Grid cell size for map (m)",
                         choices=[5, 10, 20, 30],
                         value=10,
                         interactive=True,
-                        info="Choose one grid size to preview centroid locations.",
+                        info="Choose one grid size to preview SM map and centroid locations.",
                     )
 
                     map_button = gr.Button(
@@ -1009,13 +1091,13 @@ with gr.Blocks(
                     )
 
                     map_html_output = gr.HTML(
-                        label="Field polygon and centroids"
+                        label="Field SM map and sensor centroids"
                     )
 
                     centroid_table_output = gr.Dataframe(
                         label=(
                             "Centroid coordinates "
-                            "(sensor_id, Longitude (°E), Latitude (°S))"
+                            "(sensor_id, Longitude (°E), Latitude (°S), sm_pred)"
                         ),
                         interactive=False,
                     )
@@ -1023,8 +1105,8 @@ with gr.Blocks(
                     gr.Markdown(
                         """
                         <div class="small-note">
-                        Sensor positions shown here are centroids only (no soil-moisture map), with coordinates
-                        you can copy into field sheets or Kobo forms.
+                        The coloured grid shows predicted soil moisture (%) from the model.  
+                        Red points mark sensor locations (grid centroids) with their coordinates and SM values.
                         </div>
                         """,
                         elem_classes=["small-note"],
