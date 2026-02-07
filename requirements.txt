@@ -8,3 +8,5 @@ numpy
 pandas
 requests
 scikit-learn
+geopandas
+shapely
