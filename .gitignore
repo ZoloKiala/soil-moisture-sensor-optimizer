@@ -1,2 +1,5 @@
 tethys-app-1-acc3960d3dd6.json
 extratrees_s1_soil_moisture_points.pkl
+.venv/
+*.json
+!example_*.json
